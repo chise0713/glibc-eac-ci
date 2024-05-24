@@ -1,0 +1,125 @@
+name: Arch Linux glibc-eac CI
+
+on: 
+  workflow_dispatch:
+    inputs:
+      test:
+        description: 'Test mode'
+        required: false
+        type: boolean
+  schedule: 
+    - cron:  '0 0 * * *'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:multilib-devel
+    steps:
+      - run: |
+          echo -e "[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf
+          echo "MAKEFLAGS=\"-j$((`nproc` * 2))\"" >> /etc/makepkg.conf
+          pacman -Syyu --noconfirm git github-cli jq
+      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29
+      - run: |
+          echo -e "\033[1;36mINFO:\033[0m Preparing build"
+          echo "::group::Prepare"
+          
+          echo PUSH=1 >> $GITHUB_ENV
+          WORKDIR="$PWD"
+          echo WORKDIR="$WORKDIR" >> $GITHUB_ENV
+          if [[ "${{ inputs.test }}" == "true" ]]; then
+            CURRENT_VERSION="2.39-1"
+          else
+            CURRENT_VERSION="$(
+              curl https://api.github.com/repos/chise0713/glibc-eac-ci/releases \
+              -H 'Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}'| \
+                jq '.[] | select(0) | .tag_name' -r | head -1
+            )"
+          fi
+          
+          git clone https://aur.archlinux.org/glibc-eac.git $WORKDIR/glibc-eac
+          VERSION=$(
+            export $(grep -P '(pkgver|pkgrel)=' $WORKDIR/glibc-eac/PKGBUILD | tr '\n' ' ') && \
+            echo $pkgver-$pkgrel
+          )
+          if [[ "$VERSION" == "$CURRENT_VERSION" ]]; then
+            echo "### Current version is up-to-date! 🚀" >> $GITHUB_STEP_SUMMARY
+            echo "::endgroup::"
+            exit 0
+          fi
+          echo -e "\033[1;93mWARN:\033[0m Current version is out-of-date"
+          echo -e "\033[1;93mWARN:\033[0m Current ($CURRENT_VERSION), upstream ($VERSION)"
+          
+          useradd user -G wheel && echo "user ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          mkdir $WORKDIR/build_assets
+          chown -R user:wheel $WORKDIR/glibc-eac
+          chown -R user:wheel $WORKDIR/build_assets
+
+          echo "::endgroup::"
+          
+          echo -e "\033[1;36mINFO:\033[0m Building"
+          
+          pushd $WORKDIR/glibc-eac 2>&1 >/dev/null
+          if [[ "${{ inputs.test }}" == "true" ]]; then
+            echo test stdout >$WORKDIR/build_assets/stdout.log 
+            echo test stderr >$WORKDIR/build_assets/sterr.log 
+          else
+            su user -c "PKGDEST=$WORKDIR/build_assets makepkg -s --noconfirm" \
+              >$WORKDIR/build_assets/stdout.log \
+              2>$WORKDIR/build_assets/stderr.log
+          fi
+          popd 2>&1 >/dev/null
+          
+          
+          DGST=$WORKDIR/build_assets/$VERSION.dgst
+          {
+            for METHOD in {"sha256sum","sha512sum","b2sum"}; do
+              i=0
+              for FILE in $WORKDIR/build_assets/*; do
+                if [[ "$i" == "0" ]]; then echo "[$METHOD]"; fi
+                i=1
+                if [[ "$FILE" == "$DGST" ]]; then continue; fi
+                $METHOD $FILE | sed -e "s|^|${FILE#${WORKDIR}/build_assets/}=|g" -e "s|$FILE||g"
+              done
+              unset i
+            done
+          } > $DGST
+          
+          echo -e "\033[1;36mINFO:\033[0m Complete"
+          
+          echo VERSION="$VERSION" >> $GITHUB_ENV
+          echo PUSH=0 >> $GITHUB_ENV
+          cat <<EOF >> $GITHUB_STEP_SUMMARY
+          ### Build successed! 🚀
+          Currently update to $VERSION
+          #### Digests
+          \`\`\`ini
+          $(cat $DGST)
+          \`\`\`
+          EOF
+      - if: env.PUSH == '0' && inputs.test == false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global --add safe.directory "${{ env.WORKDIR }}"
+          cat <<EOF > changelog.md
+          [CI-URL](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          ### Build successed! 🚀
+          Currently update to ${{ env.VERSION }}
+          #### Digests
+          \`\`\`ini
+          $(cat ${{ env.WORKDIR }}/build_assets/${{ env.VERSION }}.dgst)
+          \`\`\`
+          EOF
+          gh release create "${{ env.VERSION }}" \
+              --repo="${{ github.repository	}}" \
+              --title="${{ env.VERSION }}" \
+              -F changelog.md
+          gh release upload "${{ env.VERSION }}" \
+            ${{ env.WORKDIR }}/build_assets/* \
+            --repo="${{ github.repository }}"
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        if: env.PUSH == '0'
+        with:
+          name: glibc-eac-${{ env.VERSION }}
+          path: |
+            ${{ env.WORKDIR }}/build_assets/*
